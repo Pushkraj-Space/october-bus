@@ -80,6 +80,8 @@ func runMCPStdio(ctx context.Context, args ...string) (runErr error) {
 	name := flags.String("name", "", "agent display name (defaults to ID)")
 	dataDir := flags.String("data-dir", "", "local daemon data directory")
 	runtimeDir := flags.String("runtime-dir", "", "local daemon discovery directory")
+	remote := flags.String("remote", "", "HTTPS remote Bus base URL, including /bus for a hosted gateway")
+	scopeTokenFile := flags.String("scope-token-file", "", "private remote scope credential file, kept outside model context")
 	var peers stringList
 	flags.Var(&peers, "connect-to", "existing peer ID to link, repeatable")
 	if err := flags.Parse(args); err != nil {
@@ -90,39 +92,47 @@ func runMCPStdio(ctx context.Context, args ...string) (runErr error) {
 	}
 	address := strings.TrimRight(strings.TrimSpace(os.Getenv("OCTOBER_BUS_ADDRESS")), "/")
 	token := strings.TrimSpace(os.Getenv("OCTOBER_BUS_AGENT_TOKEN"))
-	selfRegister := *scope != "" || *id != "" || *name != "" || len(peers) != 0 || *dataDir != "" || *runtimeDir != ""
+	remoteMode := *remote != "" || *scopeTokenFile != ""
+	selfRegister := remoteMode || *scope != "" || *id != "" || *name != "" || len(peers) != 0 || *dataDir != "" || *runtimeDir != ""
 	if selfRegister {
 		if token != "" {
 			return errors.New("use either managed agent credentials or --scope/--agent, not both")
 		}
-		if *scope == "" || *id == "" {
-			return errors.New("self-registering mcp stdio requires --scope and --agent")
+		if *id == "" || (!remoteMode && *scope == "") {
+			return errors.New("self-registering mcp stdio requires --agent and either --scope or --remote/--scope-token-file")
 		}
 		if *name == "" {
 			*name = *id
 		}
-		var paths bus.DaemonPaths
-		if *dataDir != "" && *runtimeDir != "" {
-			paths = bus.DaemonPaths{DataDir: *dataDir, RuntimeDir: *runtimeDir, RunFile: filepath.Join(*runtimeDir, "bus.json")}
-		} else if *dataDir != "" || *runtimeDir != "" {
-			return errors.New("pass --data-dir and --runtime-dir together")
+		var owner bus.Client
+		var err error
+		if remoteMode {
+			if *remote == "" || *scopeTokenFile == "" || *scope != "" || *dataDir != "" || *runtimeDir != "" {
+				return errors.New("remote registration requires --remote and --scope-token-file, without local scope/directory flags")
+			}
+			owner, err = remoteScopeClient(*remote, *scopeTokenFile)
 		} else {
-			var err error
-			paths, err = bus.DefaultDaemonPaths()
-			if err != nil {
-				return err
+			var paths bus.DaemonPaths
+			if *dataDir != "" && *runtimeDir != "" {
+				paths = bus.DaemonPaths{DataDir: *dataDir, RuntimeDir: *runtimeDir, RunFile: filepath.Join(*runtimeDir, "bus.json")}
+			} else if *dataDir != "" || *runtimeDir != "" {
+				return errors.New("pass --data-dir and --runtime-dir together")
+			} else {
+				paths, err = bus.DefaultDaemonPaths()
+			}
+			if err == nil {
+				owner, err = localScopeClientAt(paths, *scope)
 			}
 		}
-		owner, err := localScopeClientAt(paths, *scope)
 		if err != nil {
 			return err
 		}
-		// Explicit self-registration uses local discovery, never an inherited URL.
+		// Explicit self-registration never uses an inherited URL or scope token.
 		// The session owns its context until EOF, cancellation or lease failure.
 		sessionCtx, cancelSession := context.WithCancel(ctx)
 		defer cancelSession()
 		session, err := bus.StartAgentSession(sessionCtx, bus.AgentSessionOptions{
-			Address: owner.Address, ScopeToken: owner.Token, HeartbeatInterval: 5 * time.Second,
+			Address: owner.Address, ScopeToken: owner.Token, HTTP: owner.HTTP, HeartbeatInterval: 5 * time.Second,
 			Registration: bus.RegisterAgentInput{ID: *id, DisplayName: *name, ConnectTo: peers, LeaseMS: 30_000},
 		})
 		if err != nil {
@@ -151,7 +161,7 @@ func runMCPStdio(ctx context.Context, args ...string) (runErr error) {
 	}
 
 	connectContext, cancelConnect := context.WithTimeout(ctx, 10*time.Second)
-	httpClient := &http.Client{Transport: agentTokenTransport{token: token, base: http.DefaultTransport}}
+	httpClient := &http.Client{Transport: agentTokenTransport{token: token, base: http.DefaultTransport}, CheckRedirect: rejectBusRedirect}
 	client := mcp.NewClient(&mcp.Implementation{Name: "october-bus-stdio-bridge", Version: bus.Version}, nil)
 	upstream, err := client.Connect(connectContext, &mcp.StreamableClientTransport{
 		Endpoint:             address + "/mcp",
