@@ -27,7 +27,13 @@ local harness <-- stdio bridge -- outbound HTTPS --> gateway /bus/*
 - A connector API key is stored as a SHA-256 digest in gateway configuration.
   Each key maps to one scope and dedicated connector agent. The gateway owns
   that execution's registration, heartbeat, and retirement; Muse never receives
-  scope/admin credentials. Connector readiness does not assert model readiness.
+  scope/admin credentials. The connector execution reports lifecycle `idle`
+  with `ready: true`, meaning the gateway will accept and hold work; it never
+  asserts that a model is awake. `/mcp` accepts `POST` only: the daemon serves
+  MCP stateless with JSON responses, so there is no SSE listen stream or
+  session to delete. The connector's agent ID (default `muse`) is reserved for
+  the gateway; a laptop bridge registering the same ID replaces the connector
+  execution and takes that connector offline until the gateway restarts.
 - Remote laptop bridges own their own executions. They read scope credentials
   from private files and expose only agent tools over stdio to the harness.
 - Only explicitly allowed agent/scope routes are public under `/bus`. Scope
@@ -37,6 +43,8 @@ local harness <-- stdio bridge -- outbound HTTPS --> gateway /bus/*
   executions; restart replaces its execution without discarding queued messages.
 - An unavailable individual connector returns 503 without disabling other scopes.
   If all connector executions end, the process exits for systemd to restart it.
+  `gateway start` waits up to 60 s for the daemon's readiness probe before
+  binding, so the start order is daemon, then gateway, then laptop bridges.
 
 This is an **experimental, operator-provisioned pilot**, not a self-service
 multitenant cloud or a verified Muse integration. Use one scope per person or

@@ -23,12 +23,15 @@ import (
 	"github.com/october-dev/october-bus/bus"
 )
 
+// ClientConfig maps one connector API key to one dedicated agent identity.
+// Peer links are created by the remote bridges (`--connect-to <agent>`), not
+// here: registration links inside the same transaction and fails when the peer
+// is not registered yet, which is always the case on a fresh deployment.
 type ClientConfig struct {
-	Scope        string   `json:"scope"`
-	Agent        string   `json:"agent"`
-	Name         string   `json:"name"`
-	APIKeySHA256 string   `json:"apiKeySha256"`
-	ConnectTo    []string `json:"connectTo,omitempty"`
+	Scope        string `json:"scope"`
+	Agent        string `json:"agent"`
+	Name         string `json:"name"`
+	APIKeySHA256 string `json:"apiKeySha256"`
 }
 
 type Config struct {
@@ -47,13 +50,13 @@ func (c Config) Validate() error {
 	}
 	keys, identities := map[string]bool{}, map[string]bool{}
 	for i, client := range c.Clients {
-		for _, id := range append([]string{client.Scope, client.Agent}, client.ConnectTo...) {
+		for _, id := range []string{client.Scope, client.Agent} {
 			if _, err := bus.ScopeTokenPath("", id); err != nil {
-				return fmt.Errorf("client %d has an invalid scope, agent, or peer ID", i)
+				return fmt.Errorf("client %d has an invalid scope or agent ID", i)
 			}
 		}
-		if strings.TrimSpace(client.Name) == "" || len(client.Name) > 256 || len(client.ConnectTo) > 128 {
-			return fmt.Errorf("client %d has an invalid name or peer list", i)
+		if strings.TrimSpace(client.Name) == "" || len(client.Name) > 256 {
+			return fmt.Errorf("client %d has an invalid name", i)
 		}
 		digest, err := hex.DecodeString(client.APIKeySHA256)
 		if err != nil || len(digest) != sha256.Size {
@@ -109,8 +112,9 @@ func New(ctx context.Context, upstream string, config Config, resolve func(strin
 			r.SetURL(u)
 			r.Out.Host = u.Host
 			// Never trust or forward client-supplied proxy identity or cookies.
-			r.Out.Header.Del("Forwarded")
-			r.Out.Header.Del("Cookie")
+			for _, name := range []string{"Forwarded", "Cookie", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip"} {
+				r.Out.Header.Del(name)
+			}
 		},
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
@@ -137,10 +141,17 @@ func New(ctx context.Context, upstream string, config Config, resolve func(strin
 		session, startErr := bus.StartAgentSession(ctx, bus.AgentSessionOptions{
 			Address: upstream, ScopeToken: tokens[i], HeartbeatInterval: 5 * time.Second,
 			HTTP:         &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirect},
-			Registration: bus.RegisterAgentInput{ID: entry.Agent, DisplayName: entry.Name, ConnectTo: entry.ConnectTo, LeaseMS: 30_000},
+			Registration: bus.RegisterAgentInput{ID: entry.Agent, DisplayName: entry.Name, LeaseMS: 30_000},
 		})
 		if startErr != nil {
 			return nil, fmt.Errorf("start connector %d: %w", i, startErr)
+		}
+		// The connector accepts durable work on behalf of a pull-based client,
+		// so it is idle and ready to receive; it never claims a model is awake.
+		if _, stateErr := session.SetState(ctx, bus.LifecycleIdle, true); stateErr != nil {
+			err = fmt.Errorf("report connector %d state: %w", i, stateErr)
+			_ = session.Close(ctx)
+			return nil, err
 		}
 		digest, _ := hex.DecodeString(entry.APIKeySHA256)
 		g.clients = append(g.clients, client{digest: digest, session: session, budget: make(chan struct{}, 16)})
@@ -189,14 +200,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		failure(w, http.StatusNotFound, "Route not found")
 		return
 	}
-	select {
-	case g.budget <- struct{}{}:
-		defer func() { <-g.budget }()
-	default:
-		w.Header().Set("Retry-After", "1")
-		failure(w, http.StatusTooManyRequests, "Concurrent request limit reached")
-		return
-	}
+	// Liveness answers before any budget so a flood cannot make the process
+	// look dead to its supervisor.
 	if r.URL.Path == "/health/live" && r.Method == http.MethodGet {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -207,6 +212,19 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 	}
+	if r.URL.Path == "/mcp" {
+		// Authenticate before consuming the shared budget: unauthenticated
+		// traffic must not be able to starve valid connectors.
+		g.serveConnector(w, r)
+		return
+	}
+	release, ok := acquire(g.budget)
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		failure(w, http.StatusTooManyRequests, "Concurrent request limit reached")
+		return
+	}
+	defer release()
 	if r.URL.Path == "/health/ready" && r.Method == http.MethodGet {
 		for _, c := range g.clients {
 			select {
@@ -225,11 +243,17 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.URL.Path == "/mcp" {
-		g.serveConnector(w, r)
-		return
-	}
 	g.agentMux.ServeHTTP(w, r)
+}
+
+// acquire takes one slot from a bounded budget without blocking.
+func acquire(budget chan struct{}) (release func(), ok bool) {
+	select {
+	case budget <- struct{}{}:
+		return func() { <-budget }, true
+	default:
+		return nil, false
+	}
 }
 
 func (g *Gateway) serveConnector(w http.ResponseWriter, r *http.Request) {
@@ -250,19 +274,27 @@ func (g *Gateway) serveConnector(w http.ResponseWriter, r *http.Request) {
 			return
 		default:
 		}
-		if r.Method != http.MethodPost && r.Method != http.MethodGet && r.Method != http.MethodDelete {
-			w.Header().Set("Allow", "POST, GET, DELETE")
+		// The daemon serves MCP stateless with JSON responses; GET (SSE
+		// listen) and DELETE (session end) have no meaning here.
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
 			failure(w, http.StatusMethodNotAllowed, "Method not allowed")
 			return
 		}
-		select {
-		case c.budget <- struct{}{}:
-			defer func() { <-c.budget }()
-		default:
+		releaseClient, ok := acquire(c.budget)
+		if !ok {
 			w.Header().Set("Retry-After", "1")
 			failure(w, http.StatusTooManyRequests, "Connector request limit reached")
 			return
 		}
+		defer releaseClient()
+		releaseGlobal, ok := acquire(g.budget)
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			failure(w, http.StatusTooManyRequests, "Concurrent request limit reached")
+			return
+		}
+		defer releaseGlobal()
 		clone := r.Clone(r.Context())
 		clone.Header.Set("Authorization", "Bearer "+c.session.Registration.AgentToken)
 		g.proxy.ServeHTTP(w, clone)
@@ -278,7 +310,7 @@ func (g *Gateway) remoteAgentRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
 	patterns := []string{
 		"GET /health", "GET /health/live", "GET /health/ready",
-		"POST /mcp", "GET /mcp", "DELETE /mcp",
+		"POST /mcp",
 		"GET /v1/agents", "POST /v1/agents", "POST /v1/links",
 		"GET /v1/me", "PATCH /v1/me/heartbeat", "POST /v1/me/retire", "GET /v1/peers",
 		"POST /v1/messages", "GET /v1/messages/{messageId}", "POST /v1/messages/ack",

@@ -299,3 +299,108 @@ func TestGatewayValidatesConfigurationBeforeRegistration(t *testing.T) {
 		}
 	}
 }
+
+func TestGatewayConnectorReportsIdleAndReady(t *testing.T) {
+	f := setup(t, 1)
+	worker := f.worker(t, "owner-0")
+	peers, err := worker.Client.ListPeers(context.Background())
+	must(t, err)
+	if len(peers) != 1 || peers[0].ID != "muse" || peers[0].Lifecycle != bus.LifecycleIdle || !peers[0].Ready {
+		t.Fatalf("connector execution did not report idle/ready: %+v", peers)
+	}
+}
+
+func TestGatewayConnectorAcceptsOnlyPost(t *testing.T) {
+	f := setup(t, 1)
+	for _, method := range []string{"GET", "DELETE", "PUT"} {
+		r := httptest.NewRequest(method, "/mcp", nil)
+		r.Host = "bus.example.test"
+		r.Header.Set("Authorization", "Bearer "+f.keys[0])
+		w := httptest.NewRecorder()
+		f.g.ServeHTTP(w, r)
+		if w.Code != 405 || w.Header().Get("Allow") != "POST" {
+			t.Fatalf("%s /mcp: got %d Allow=%q, want 405 Allow=POST", method, w.Code, w.Header().Get("Allow"))
+		}
+	}
+	for _, method := range []string{"GET", "DELETE"} {
+		r := httptest.NewRequest(method, "/bus/mcp", nil)
+		r.Host = "bus.example.test"
+		w := httptest.NewRecorder()
+		f.g.ServeHTTP(w, r)
+		if w.Code != 404 {
+			t.Fatalf("%s /bus/mcp is public: %d", method, w.Code)
+		}
+	}
+}
+
+func TestGatewayBudgetsRejectWithRetryAfterAndNeverStarveAuth(t *testing.T) {
+	f := setup(t, 1)
+	serve := func(method, route, key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, route, strings.NewReader(`{}`))
+		r.Host = "bus.example.test"
+		if key != "" {
+			r.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		f.g.ServeHTTP(w, r)
+		return w
+	}
+	// Fill the shared budget as an unauthenticated flood would try to.
+	for i := 0; i < cap(f.g.budget); i++ {
+		f.g.budget <- struct{}{}
+	}
+	if w := serve("GET", "/bus/v1/peers", ""); w.Code != 429 || w.Header().Get("Retry-After") != "1" {
+		t.Fatalf("exhausted shared budget did not return 429 with Retry-After: %d", w.Code)
+	}
+	if w := serve("GET", "/health/live", ""); w.Code != 204 {
+		t.Fatalf("liveness must not depend on the request budget: %d", w.Code)
+	}
+	if w := serve("POST", "/mcp", "not-a-valid-key-but-long-enough-to-pass-length-checks"); w.Code != 401 {
+		t.Fatalf("invalid key must be rejected before the budget, got %d", w.Code)
+	}
+	if w := serve("POST", "/mcp", f.keys[0]); w.Code != 429 {
+		t.Fatalf("valid key over the shared budget should be 429, got %d", w.Code)
+	}
+	for i := 0; i < cap(f.g.budget); i++ {
+		<-f.g.budget
+	}
+	// Per-connector budget is independent of the shared one.
+	for i := 0; i < cap(f.g.clients[0].budget); i++ {
+		f.g.clients[0].budget <- struct{}{}
+	}
+	if w := serve("POST", "/mcp", f.keys[0]); w.Code != 429 || w.Header().Get("Retry-After") != "1" {
+		t.Fatalf("exhausted connector budget did not return 429: %d", w.Code)
+	}
+	if w := serve("GET", "/bus/v1/peers", ""); w.Code == 429 {
+		t.Fatal("connector budget leaked into the shared budget")
+	}
+	for i := 0; i < cap(f.g.clients[0].budget); i++ {
+		<-f.g.clients[0].budget
+	}
+	if w := serve("POST", "/mcp", f.keys[0]); w.Code == 429 {
+		t.Fatal("budget slot was not released")
+	}
+}
+
+func TestGatewayReportsBadGatewayWhenDaemonIsDown(t *testing.T) {
+	f := setup(t, 1)
+	// Stop accepting connections without ending the registered execution, so
+	// the proxy path (not the fail-closed path) is what answers.
+	must(t, f.private.Listener.Close())
+	f.private.CloseClientConnections()
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	r.Host = "bus.example.test"
+	r.Header.Set("Authorization", "Bearer "+f.keys[0])
+	w := httptest.NewRecorder()
+	f.g.ServeHTTP(w, r)
+	if w.Code != 502 {
+		t.Fatalf("daemon down should be 502 from the proxy, got %d", w.Code)
+	}
+	r = httptest.NewRequest("GET", "/health/ready", nil)
+	r.Host = "bus.example.test"
+	w = httptest.NewRecorder()
+	f.g.ServeHTTP(w, r)
+	if w.Code != 503 {
+		t.Fatalf("readiness with daemon down should be 503, got %d", w.Code)
+	}
+}

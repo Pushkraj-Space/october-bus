@@ -145,6 +145,12 @@ func runMCPStdio(ctx context.Context, args ...string) (runErr error) {
 				runErr = errors.Join(runErr, fmt.Errorf("agent session ended: %w", err))
 			}
 		}()
+		// The harness launched this bridge and owns the process, so peers may
+		// send work: ready means attached and reachable, not that a model turn
+		// is running. Delivery still never implies execution.
+		if _, err := session.SetState(sessionCtx, bus.LifecycleReady, true); err != nil {
+			return fmt.Errorf("could not report agent state: %w", err)
+		}
 		bridgeCtx, cancelBridge := context.WithCancel(ctx)
 		defer cancelBridge()
 		go func() {
