@@ -249,9 +249,17 @@ Suggested access requirements:
 > sessions. Their computer and receiving agents must be online and consuming
 > messages for work to execute. Existing coding-tool accounts, subscriptions, and
 > approvals still apply. Each connector is limited to its provisioned scope and
-> linked peers. The gateway permits 16 concurrent requests per connector and 128
-> overall; Bus request, queue, and storage limits also apply. OAuth, self-service
-> onboarding, and automatic session wake-up are not implemented by this gateway.
+> linked peers. The gateway admits requests from three bounded pools: 32 slots
+> for credential checks and health probes, 32 for validated heartbeat and
+> retirement, and 128 shared by validated bridge requests and connector requests
+> (16 per connector). A request without a valid credential never occupies the
+> heartbeat or shared pools, and occupies a credential-check slot only for one
+> header-only loopback call that the client cannot prolong. These sizes are
+> bounds, not isolation guarantees: heartbeats compete for credential checks
+> with all unauthenticated traffic, and a holder of a valid credential can
+> still exhaust the shared pool. Bus request, queue, and storage limits also
+> apply. OAuth, self-service onboarding, and automatic session wake-up are not
+> implemented by this gateway.
 > Muse compatibility remains to be verified.
 
 The exact authentication mechanisms Muse accepts for a given review still need

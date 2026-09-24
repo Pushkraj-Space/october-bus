@@ -246,6 +246,9 @@ func startGateway(args []string) (runErr error) {
 		defer cancel()
 		runErr = errors.Join(runErr, g.Close(cleanup))
 	}()
+	// ReadTimeout also bounds the post-response drain of a withheld request
+	// body: the gateway flushes rejections before reading a body, but net/http
+	// still discards up to 256 KiB of it on the connection goroutine afterwards.
 	server := &http.Server{Handler: g, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	finished := make(chan error, 1)
 	go func() { finished <- server.Serve(listener) }()

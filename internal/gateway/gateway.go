@@ -77,17 +77,34 @@ type client struct {
 	budget  chan struct{}
 }
 
+// Gateway admission mirrors the daemon's own request/control split. An
+// unauthenticated request never occupies control or budget, and occupies
+// admission only for the duration of one header-only loopback call.
+//
+//	admission  credential probes, /health/ready, /bus/health*   (32)
+//	control    validated heartbeat and retirement                 (32)
+//	budget     validated everything else, and connector /mcp     (128)
+//
+// Sizes are bounds, not isolation proofs: heartbeats compete for admission
+// with all unauthenticated traffic. The probe uses the daemon's dedicated
+// classification pool, so neither long-lived daemon requests nor a burst of
+// invalid probes can take slots from local or remote heartbeats.
 type Gateway struct {
 	origin   string
 	host     string
 	upstream string
 	clients  []client
 	proxy    *httputil.ReverseProxy
-	agentMux *http.ServeMux
-	budget   chan struct{}
-	done     chan struct{}
-	failOnce sync.Once
-	failed   atomic.Int32
+	probe    *http.Client
+	// probeTimeout bounds one credential probe; tests raise it to park probes.
+	probeTimeout time.Duration
+	agentMux     *http.ServeMux
+	admission    chan struct{}
+	control      chan struct{}
+	budget       chan struct{}
+	done         chan struct{}
+	failOnce     sync.Once
+	failed       atomic.Int32
 }
 
 // New starts one execution per connector, not per HTTP request. The execution
@@ -106,8 +123,18 @@ func New(ctx context.Context, upstream string, config Config, resolve func(strin
 		return nil, errors.New("upstream must be a loopback HTTP origin")
 	}
 	public, _ := url.Parse(config.PublicURL)
-	g := &Gateway{origin: config.PublicURL, host: public.Host, upstream: upstream, budget: make(chan struct{}, 128), done: make(chan struct{})}
+	// One upstream transport with enough idle connections for every pool, so
+	// the probe and the proxy reuse loopback connections instead of opening
+	// one per request (DefaultTransport keeps only two idle per host).
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns, transport.MaxIdleConnsPerHost = 256, 256
+	g := &Gateway{
+		origin: config.PublicURL, host: public.Host, upstream: upstream, done: make(chan struct{}),
+		admission: make(chan struct{}, 32), control: make(chan struct{}, 32), budget: make(chan struct{}, 128),
+		probe: &http.Client{Transport: transport, CheckRedirect: noRedirect}, probeTimeout: 5 * time.Second,
+	}
 	g.proxy = &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(u)
 			r.Out.Host = u.Host
@@ -137,21 +164,27 @@ func New(ctx context.Context, upstream string, config Config, resolve func(strin
 			return nil, fmt.Errorf("resolve scope for client %d: %w", i, err)
 		}
 	}
+	// A daemon without GET /v1/credential would answer every remote request
+	// with 502. Refuse to start before any connector execution is displaced.
+	probeCtx, cancelProbe := context.WithTimeout(ctx, g.probeTimeout)
+	defer cancelProbe()
+	if _, err := (bus.Client{Address: upstream, Token: tokens[0], HTTP: g.probe}).Credential(probeCtx, ""); err != nil {
+		if bus.AsBusError(err).Code == bus.CodeNotFound {
+			return nil, errors.New("daemon does not serve GET /v1/credential; upgrade the daemon before starting the gateway")
+		}
+		return nil, fmt.Errorf("credential probe for client 0: %w", err)
+	}
 	for i, entry := range config.Clients {
+		// The connector accepts durable work on behalf of a pull-based client,
+		// so it is idle and ready to receive; it never claims a model is awake.
 		session, startErr := bus.StartAgentSession(ctx, bus.AgentSessionOptions{
 			Address: upstream, ScopeToken: tokens[i], HeartbeatInterval: 5 * time.Second,
-			HTTP:         &http.Client{Timeout: 30 * time.Second, CheckRedirect: noRedirect},
-			Registration: bus.RegisterAgentInput{ID: entry.Agent, DisplayName: entry.Name, LeaseMS: 30_000},
+			HTTP:             &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: noRedirect},
+			Registration:     bus.RegisterAgentInput{ID: entry.Agent, DisplayName: entry.Name, LeaseMS: 30_000},
+			InitialLifecycle: bus.LifecycleIdle, InitialReady: true,
 		})
 		if startErr != nil {
 			return nil, fmt.Errorf("start connector %d: %w", i, startErr)
-		}
-		// The connector accepts durable work on behalf of a pull-based client,
-		// so it is idle and ready to receive; it never claims a model is awake.
-		if _, stateErr := session.SetState(ctx, bus.LifecycleIdle, true); stateErr != nil {
-			err = fmt.Errorf("report connector %d state: %w", i, stateErr)
-			_ = session.Close(ctx)
-			return nil, err
 		}
 		digest, _ := hex.DecodeString(entry.APIKeySHA256)
 		g.clients = append(g.clients, client{digest: digest, session: session, budget: make(chan struct{}, 16)})
@@ -181,10 +214,26 @@ func (g *Gateway) Close(ctx context.Context) error {
 	return result
 }
 
+// failure closes the connection so net/http flushes the rejection before
+// reading any of the request body (chunkWriter.writeHeader skips its pre-flush
+// drain when closeAfterReply is set). Pool slots are released and the client
+// sees the rejection at once; the connection goroutine may still discard a
+// withheld body afterwards, bounded by the server's ReadTimeout.
 func failure(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Connection", "close")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func unauthenticated(w http.ResponseWriter, message string) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="october-bus"`)
+	failure(w, http.StatusUnauthorized, message)
+}
+
+func limited(w http.ResponseWriter, message string) {
+	w.Header().Set("Retry-After", "1")
+	failure(w, http.StatusTooManyRequests, message)
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -218,32 +267,51 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.serveConnector(w, r)
 		return
 	}
-	release, ok := acquire(g.budget)
-	if !ok {
-		w.Header().Set("Retry-After", "1")
-		failure(w, http.StatusTooManyRequests, "Concurrent request limit reached")
-		return
-	}
-	defer release()
 	if r.URL.Path == "/health/ready" && r.Method == http.MethodGet {
-		for _, c := range g.clients {
-			select {
-			case <-c.session.Done():
-				failure(w, http.StatusServiceUnavailable, "A connector is unavailable")
-				return
-			default:
-			}
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if _, err := (bus.Client{Address: g.upstream, HTTP: &http.Client{CheckRedirect: noRedirect}}).Health(ctx); err != nil {
-			failure(w, http.StatusServiceUnavailable, "Bus is unavailable")
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+		g.serveReady(w, r)
 		return
 	}
 	g.agentMux.ServeHTTP(w, r)
+}
+
+// serveReady is unauthenticated, so it takes only the admission pool and never
+// reads a client body.
+func (g *Gateway) serveReady(w http.ResponseWriter, r *http.Request) {
+	if !rejectBody(w, r) {
+		return
+	}
+	release, ok := acquire(g.admission)
+	if !ok {
+		limited(w, "Concurrent request limit reached")
+		return
+	}
+	defer release()
+	for _, c := range g.clients {
+		select {
+		case <-c.session.Done():
+			failure(w, http.StatusServiceUnavailable, "A connector is unavailable")
+			return
+		default:
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if _, err := (bus.Client{Address: g.upstream, HTTP: g.probe}).Health(ctx); err != nil {
+		failure(w, http.StatusServiceUnavailable, "Bus is unavailable")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// rejectBody refuses a declared or chunked body on a route that is served
+// without a credential. A held body would otherwise be drained inside the
+// handler, while the admission slot is still occupied.
+func rejectBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.ContentLength != 0 {
+		failure(w, http.StatusBadRequest, "Health probes do not accept a request body")
+		return false
+	}
+	return true
 }
 
 // acquire takes one slot from a bounded budget without blocking.
@@ -259,8 +327,7 @@ func acquire(budget chan struct{}) (release func(), ok bool) {
 func (g *Gateway) serveConnector(w http.ResponseWriter, r *http.Request) {
 	scheme, key, found := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") || len(key) < 32 || len(key) > 256 || len(r.Header.Values("Authorization")) != 1 {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="october-bus"`)
-		failure(w, http.StatusUnauthorized, "Invalid connector API key")
+		unauthenticated(w, "Invalid connector API key")
 		return
 	}
 	digest := sha256.Sum256([]byte(key))
@@ -283,15 +350,13 @@ func (g *Gateway) serveConnector(w http.ResponseWriter, r *http.Request) {
 		}
 		releaseClient, ok := acquire(c.budget)
 		if !ok {
-			w.Header().Set("Retry-After", "1")
-			failure(w, http.StatusTooManyRequests, "Connector request limit reached")
+			limited(w, "Connector request limit reached")
 			return
 		}
 		defer releaseClient()
 		releaseGlobal, ok := acquire(g.budget)
 		if !ok {
-			w.Header().Set("Retry-After", "1")
-			failure(w, http.StatusTooManyRequests, "Concurrent request limit reached")
+			limited(w, "Concurrent request limit reached")
 			return
 		}
 		defer releaseGlobal()
@@ -300,8 +365,7 @@ func (g *Gateway) serveConnector(w http.ResponseWriter, r *http.Request) {
 		g.proxy.ServeHTTP(w, clone)
 		return
 	}
-	w.Header().Set("WWW-Authenticate", `Bearer realm="october-bus"`)
-	failure(w, http.StatusUnauthorized, "Invalid connector API key")
+	unauthenticated(w, "Invalid connector API key")
 }
 
 // Remote launchers authenticate directly to the existing Bus agent/scope APIs.
@@ -324,12 +388,94 @@ func (g *Gateway) remoteAgentRoutes() *http.ServeMux {
 	}
 	for _, pattern := range patterns {
 		method, route, _ := strings.Cut(pattern, " ")
-		mux.HandleFunc(method+" /bus"+route, func(w http.ResponseWriter, r *http.Request) {
-			clone := r.Clone(r.Context())
-			clone.URL.Path = strings.TrimPrefix(clone.URL.Path, "/bus")
-			g.proxy.ServeHTTP(w, clone)
-		})
+		var handler http.HandlerFunc
+		// Same classes as the daemon's own ServeHTTP switch.
+		switch route {
+		case "/health", "/health/live", "/health/ready":
+			handler = g.forwardHealth
+		case "/v1/me/heartbeat", "/v1/me/retire":
+			handler = g.forwardValidated(g.control, route == "/v1/me/retire")
+		default:
+			handler = g.forwardValidated(g.budget, false)
+		}
+		mux.HandleFunc(method+" /bus"+route, handler)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { failure(w, http.StatusNotFound, "Route not found") })
 	return mux
+}
+
+// forwardHealth proxies an unauthenticated, bodyless health probe under the
+// admission pool and a bounded deadline.
+func (g *Gateway) forwardHealth(w http.ResponseWriter, r *http.Request) {
+	if !rejectBody(w, r) {
+		return
+	}
+	release, ok := acquire(g.admission)
+	if !ok {
+		limited(w, "Concurrent request limit reached")
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	clone := r.Clone(ctx)
+	clone.URL.Path = strings.TrimPrefix(clone.URL.Path, "/bus")
+	g.proxy.ServeHTTP(w, clone)
+}
+
+// forwardValidated proxies one allowlisted route only after the daemon has
+// classified the bearer. The client body starts streaming only under a
+// validated credential and a slot from the route's pool.
+func (g *Gateway) forwardValidated(pool chan struct{}, retire bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, found := strings.Cut(r.Header.Get("Authorization"), " ")
+		token = strings.TrimSpace(token)
+		if !found || !strings.EqualFold(scheme, "Bearer") || token == "" || len(r.Header.Values("Authorization")) != 1 {
+			unauthenticated(w, "Bearer token is required")
+			return
+		}
+		if !g.admit(w, r, token, retire) {
+			return
+		}
+		release, ok := acquire(pool)
+		if !ok {
+			limited(w, "Concurrent request limit reached")
+			return
+		}
+		defer release()
+		clone := r.Clone(r.Context())
+		clone.URL.Path = strings.TrimPrefix(clone.URL.Path, "/bus")
+		g.proxy.ServeHTTP(w, clone)
+	}
+}
+
+// admit classifies the bearer with one header-only loopback call that the
+// client cannot prolong, holding the admission pool only for its duration.
+// The purpose comes from the matched route, never from the client's query.
+// Success is classification only; the daemon still authenticates the request.
+func (g *Gateway) admit(w http.ResponseWriter, r *http.Request, token string, retire bool) bool {
+	release, ok := acquire(g.admission)
+	if !ok {
+		limited(w, "Concurrent request limit reached")
+		return false
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(r.Context(), g.probeTimeout)
+	defer cancel()
+	purpose := ""
+	if retire {
+		purpose = "retire"
+	}
+	_, err := (bus.Client{Address: g.upstream, Token: token, HTTP: g.probe}).Credential(ctx, purpose)
+	switch {
+	case err == nil:
+		return true
+	case bus.AsBusError(err).Code == bus.CodeUnauthenticated:
+		unauthenticated(w, "Invalid credential")
+	case bus.AsBusError(err).Code == bus.CodeBackpressure:
+		limited(w, "Bus request limit reached")
+	default:
+		failure(w, http.StatusBadGateway, "Bus is unavailable")
+	}
+	return false
 }
